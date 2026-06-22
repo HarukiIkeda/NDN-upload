@@ -24,6 +24,8 @@ class Producer:
         next_hop = os.getenv("NEXT_HOP_HOST", "router6")
         self.next_hop_addr = (next_hop, 9000)
         self.session_keys = {}
+        # パイプライン管理用の状態保存辞書
+        self.pipelines = {} 
 
     async def request_chunk(self, session_id, chunk_id, chunk_size, transport):
         # フロー5: I_3 送信
@@ -31,6 +33,7 @@ class Producer:
         if not key:
             return
 
+        # 暗号化データに session_id を含める修正を反映
         param_dict = {"session_id": session_id, "chunk_id": chunk_id, "chunk_size": chunk_size}
         iv_hex, cipher_hex = encrypt_data(json.dumps(param_dict), key)
 
@@ -45,6 +48,23 @@ class Producer:
         }
         transport.sendto(json.dumps(i3_packet).encode('utf-8'), self.next_hop_addr)
         print(f"[Producer] Sent I_3 requesting chunk {chunk_id}/{chunk_size}")
+
+    async def fill_pipeline(self, session_id, transport):
+        state = self.pipelines.get(session_id)
+        if not state:
+            return
+
+        # 現在ネットワーク上に飛んでいる（未受信の）Interestの数を計算
+        in_flight = (state["next_request_id"] - 1) - len(state["received_chunks"])
+
+        # ウィンドウに空きがあり、かつ要求すべきチャンクが残っている間ループして連続送信
+        while in_flight < state["window_size"] and state["next_request_id"] <= state["total_chunks"]:
+            chunk_id = state["next_request_id"]
+            
+            await self.request_chunk(session_id, chunk_id, state["total_chunks"], transport)
+            
+            state["next_request_id"] += 1
+            in_flight += 1
 
     async def handle_packet(self, data, addr, transport):
         packet = json.loads(data.decode('utf-8'))
@@ -83,23 +103,39 @@ class Producer:
             transport.sendto(json.dumps(d2_packet).encode('utf-8'), addr)
             print(f"[Producer] Sent D_2 to Gateway")
 
-            # フロー5へ移行 (最初のチャンクを要求)
-            asyncio.create_task(self.request_chunk(session_id, 1, chunk_size, transport))
+            # パイプラインの初期化
+            self.pipelines[session_id] = {
+                "total_chunks": chunk_size,
+                "next_request_id": 1,
+                "received_chunks": set(),
+                "window_size": 3  # ここで同時送信数を調整可能
+            }
+
+            # フロー5へ移行 (最初のパイプライン充填。I_3がウィンドウサイズ分一気に送信される)
+            asyncio.create_task(self.fill_pipeline(session_id, transport))
 
         elif p_type == "DATA" and name.startswith("/network-A/data-request"):
             # フロー8: D_3 を受信
             session_id = param.get("session_id")
             chunk_id = param.get("chunk_id")
-            chunk_size = param.get("chunk_size")
+            # chunk_size = param.get("chunk_size") # パイプライン管理に移行したため未使用
             payload = param.get("data")
 
             print(f"[Producer] Successfully received chunk {chunk_id}: {payload}")
 
-            # 次のチャンクを要求
-            if chunk_id < chunk_size:
-                asyncio.create_task(self.request_chunk(session_id, chunk_id + 1, chunk_size, transport))
-            else:
-                print(f"[Producer] 🌟 Upload Complete for session: {session_id} 🌟")
+            # パイプライン状態の更新
+            state = self.pipelines.get(session_id)
+            if state:
+                state["received_chunks"].add(chunk_id)
+                
+                # 全チャンクの受信が完了したかチェック
+                if len(state["received_chunks"]) >= state["total_chunks"]:
+                    print(f"[Producer] 🌟 Upload Complete for session: {session_id} 🌟")
+                    # メモリリーク防止のためセッション情報を削除
+                    del self.pipelines[session_id]
+                else:
+                    # ウィンドウに空きができたので、次を充填（要求）する
+                    asyncio.create_task(self.fill_pipeline(session_id, transport))
 
 class UDPListener:
     def __init__(self, node): self.node = node

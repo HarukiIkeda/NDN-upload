@@ -1,0 +1,65 @@
+version: '3.8'
+
+services:
+  consumer:
+    build: .
+    command: python consumer.py
+    environment:
+      - NEXT_HOP_HOST=router1
+    depends_on: [router1]
+
+  router1:
+    build: .
+    command: python router.py
+    environment:
+      - ROUTER_NAME=router1
+      - FIB_ROUTES=/producer-01:router2:9000,/network-A:consumer:9000
+
+  router2:
+    build: .
+    command: python router.py
+    environment:
+      - ROUTER_NAME=router2
+      - FIB_ROUTES=/producer-01:router3:9000,/network-A:router1:9000
+
+  router3:
+    build: .
+    command: python router.py
+    environment:
+      - ROUTER_NAME=router3
+      - FIB_ROUTES=/producer-01:gateway:9000,/network-A:router2:9000
+
+  gateway:
+    build: .
+    command: python gateway.py
+    environment:
+      - FIB_ROUTES=/producer-01:router4:9000,/network-A:router3:9000
+    depends_on: [router3, router4]
+
+  router4:
+    build: .
+    command: python router.py
+    environment:
+      - ROUTER_NAME=router4
+      - FIB_ROUTES=/producer-01:router5:9000,/network-A:gateway:9000
+
+  router5:
+    build: .
+    command: python router.py
+    environment:
+      - ROUTER_NAME=router5
+      - FIB_ROUTES=/producer-01:router6:9000,/network-A:router4:9000
+
+  router6:
+    build: .
+    command: python router.py
+    environment:
+      - ROUTER_NAME=router6
+      - FIB_ROUTES=/producer-01:producer:9000,/network-A:router5:9000
+
+  producer:
+    build: .
+    command: python producer.py
+    environment:
+      - NEXT_HOP_HOST=router6
+    depends_on: [router6]
